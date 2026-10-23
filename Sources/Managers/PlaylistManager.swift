@@ -55,6 +55,12 @@ public class PlaylistManager: ObservableObject {
     // IPTV / Stream Loading State
     @Published public var isM3ULoading: Bool = false
     @Published public var m3uLoadingStatus: String = ""
+    @Published public var availableGroups: [String] = []
+    
+    public func updateAvailableGroups() {
+        let groups = Array(Set(items.compactMap { $0.group?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
+        self.availableGroups = groups
+    }
     
     // Auto-skip state for offline channels
     private var consecutiveErrors: Int = 0
@@ -321,6 +327,7 @@ public class PlaylistManager: ObservableObject {
                 
                 DispatchQueue.main.async {
                     self.items = parsed
+                    self.updateAvailableGroups()
                     self.isM3ULoading = false
                     self.m3uLoadingStatus = "Ready (\(parsed.count) channels)"
                     self.savePlaylistAsync()
@@ -595,6 +602,7 @@ public class PlaylistManager: ObservableObject {
         if let data = try? Data(contentsOf: playlistStorageURL),
            let decoded = try? JSONDecoder().decode([PlaylistItem].self, from: data) {
             self.items = decoded
+            self.updateAvailableGroups()
         }
         if let data = try? Data(contentsOf: historyStorageURL),
            let decoded = try? JSONDecoder().decode([PlaylistItem].self, from: data) {

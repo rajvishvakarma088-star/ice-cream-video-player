@@ -72,8 +72,18 @@ public class MediaLibraryManager: ObservableObject {
     private let libraryItemsURL: URL
     private let foldersURL: URL
     
-    private let fileQueue = DispatchQueue(label: "org.icecream.medialibrary.scanner", qos: .userInitiated)
-    private let thumbQueue = DispatchQueue(label: "org.icecream.medialibrary.thumbnails", qos: .utility)
+    private let fileQueue = DispatchQueue(label: "org.icecream.medialibrary.scanner", qos: .utility)
+    private let thumbQueue = DispatchQueue(label: "org.icecream.medialibrary.thumbnails", qos: .background)
+    
+    private var thumbnailUpdateScheduled = false
+    private func notifyThumbnailUpdated() {
+        guard !thumbnailUpdateScheduled else { return }
+        thumbnailUpdateScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.thumbnailUpdateScheduled = false
+            self?.objectWillChange.send()
+        }
+    }
     
     public init() {
         let fileManager = FileManager.default
@@ -307,10 +317,25 @@ public class MediaLibraryManager: ObservableObject {
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         )
         
+        let baseCount = folder.pathComponents.count
         while let fileURL = enumerator?.nextObject() as? URL {
             let path = fileURL.path
-            // Skip noisy developer caches or OS system directories
-            if path.contains("/Library/") || path.contains("/node_modules/") || path.contains("/.git/") || path.contains("/DerivedData/") || path.contains("/.Trash/") {
+            
+            // Limit depth to 4 subdirectories to avoid deep recursive traversal of endless project trees
+            let currentDepth = fileURL.pathComponents.count - baseCount
+            if currentDepth > 4 {
+                enumerator?.skipDescendants()
+                continue
+            }
+            
+            // Skip noisy developer caches, iCloud placeholders, and hidden system directories
+            if path.hasSuffix(".icloud") ||
+               path.contains("/Library/") ||
+               path.contains("/node_modules/") ||
+               path.contains("/.git/") ||
+               path.contains("/DerivedData/") ||
+               path.contains("/.Trash/") ||
+               path.contains("/.") {
                 continue
             }
             
@@ -474,8 +499,9 @@ public class MediaLibraryManager: ObservableObject {
                     try? jpegData.write(to: diskURL)
                 }
                 
+                // Throttled notification: Coalesces rapid thumbnail updates so the UI never stutters or freezes
                 DispatchQueue.main.async {
-                    self.objectWillChange.send()
+                    self.notifyThumbnailUpdated()
                 }
             }
         }

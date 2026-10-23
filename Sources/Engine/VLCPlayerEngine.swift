@@ -90,6 +90,10 @@ public class VLCPlayerEngine: ObservableObject {
     @Published public var errorMessage: String? = nil
     @Published public var statusToast: String? = nil
     
+    // Dedicated background worker queue for all blocking LibVLC C API calls
+    private let vlcQueue = DispatchQueue(label: "org.icecream.vlc.worker", qos: .userInitiated)
+    private var isTicking: Bool = false
+    
     // Update timer
     private var updateTimer: Timer?
     private var isUserSeeking: Bool = false
@@ -247,87 +251,96 @@ public class VLCPlayerEngine: ObservableObject {
             return
         }
         
-        // 1. Crucial: Stop previous media player FIRST before releasing media or changing state!
-        // This avoids race conditions and crashes in background decoder threads!
-        libvlc_media_player_stop(player)
-        cleanupMedia()
-        
         self.currentMediaURL = url
         self.currentMediaTitle = title ?? url.deletingPathExtension().lastPathComponent
         self.abPointAMs = nil
         self.abPointBMs = nil
         self.abLoopEnabled = false
         self.errorMessage = nil
-        
         self.isNetworkStream = !url.isFileURL
         self.bufferingPercentage = 0.0
+        self.state = .opening
         
-        let media: OpaquePointer?
-        if url.isFileURL {
-            let path = url.path
-            media = path.withCString { libvlc_media_new_path(inst, $0) }
-        } else {
-            let urlString = url.absoluteString
-            media = urlString.withCString { libvlc_media_new_location(inst, $0) }
-        }
-        
-        guard let validMedia = media else {
-            self.errorMessage = "Failed to create media item from \(url.lastPathComponent)"
-            self.state = .error
-            return
-        }
-        
-        if !url.isFileURL {
-            ":network-caching=2500".withCString { libvlc_media_add_option(validMedia, $0) }
-            ":live-caching=2500".withCString { libvlc_media_add_option(validMedia, $0) }
-            ":sout-mux-caching=2500".withCString { libvlc_media_add_option(validMedia, $0) }
-            ":http-reconnect".withCString { libvlc_media_add_option(validMedia, $0) }
+        vlcQueue.async { [weak self] in
+            guard let self = self else { return }
             
-            // Apply custom options from M3U (#EXTVLCOPT / headers)
-            for opt in options {
-                let trimmed = opt.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty {
-                    let formatted = trimmed.hasPrefix(":") ? trimmed : ":\(trimmed)"
-                    formatted.withCString { libvlc_media_add_option(validMedia, $0) }
+            // 1. Crucial: Stop previous media player in background worker thread!
+            // Never blocks the main UI thread during network or decoder teardown!
+            libvlc_media_player_stop(player)
+            self.cleanupMedia()
+            
+            let media: OpaquePointer?
+            if url.isFileURL {
+                let path = url.path
+                media = path.withCString { libvlc_media_new_path(inst, $0) }
+            } else {
+                let urlString = url.absoluteString
+                media = urlString.withCString { libvlc_media_new_location(inst, $0) }
+            }
+            
+            guard let validMedia = media else {
+                DispatchQueue.main.async {
+                    self.errorMessage = "Failed to create media item from \(url.lastPathComponent)"
+                    self.state = .error
+                }
+                return
+            }
+            
+            if !url.isFileURL {
+                ":network-caching=2500".withCString { libvlc_media_add_option(validMedia, $0) }
+                ":live-caching=2500".withCString { libvlc_media_add_option(validMedia, $0) }
+                ":sout-mux-caching=2500".withCString { libvlc_media_add_option(validMedia, $0) }
+                ":http-reconnect".withCString { libvlc_media_add_option(validMedia, $0) }
+                
+                // Apply custom options from M3U (#EXTVLCOPT / headers)
+                for opt in options {
+                    let trimmed = opt.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        let formatted = trimmed.hasPrefix(":") ? trimmed : ":\(trimmed)"
+                        formatted.withCString { libvlc_media_add_option(validMedia, $0) }
+                    }
                 }
             }
-        }
-        
-        self.currentMedia = validMedia
-        libvlc_media_player_set_media(player, validMedia)
-        
-        // Ensure LibVLC outputs to our persistent single videoSurface
-        let surfacePtr = Unmanaged.passUnretained(videoSurface).toOpaque()
-        libvlc_media_player_set_nsobject(player, surfacePtr)
-        
-        libvlc_media_player_play(player)
-        self.state = .playing
-        
-        if startTimeMs > 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.seek(toMs: startTimeMs)
+            
+            self.currentMedia = validMedia
+            libvlc_media_player_set_media(player, validMedia)
+            
+            // Ensure LibVLC outputs to our persistent single videoSurface
+            let surfacePtr = Unmanaged.passUnretained(self.videoSurface).toOpaque()
+            libvlc_media_player_set_nsobject(player, surfacePtr)
+            
+            libvlc_media_player_play(player)
+            
+            DispatchQueue.main.async {
+                self.state = .playing
+                if startTimeMs > 0 {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                        self?.seek(toMs: startTimeMs)
+                    }
+                }
+                self.refreshTracks()
             }
         }
-        
-        refreshTracks()
     }
     
     public func play() {
         guard let player = mediaPlayer else { return }
-        libvlc_media_player_play(player)
         self.state = .playing
+        vlcQueue.async {
+            libvlc_media_player_play(player)
+        }
     }
     
     public func pause() {
         guard let player = mediaPlayer else { return }
-        libvlc_media_player_pause(player)
         self.state = .paused
+        vlcQueue.async {
+            libvlc_media_player_pause(player)
+        }
     }
     
     public func togglePlayPause() {
-        guard let player = mediaPlayer else { return }
-        let isPlaying = libvlc_media_player_is_playing(player) == 1
-        if isPlaying {
+        if state == .playing {
             pause()
         } else {
             play()
@@ -335,11 +348,14 @@ public class VLCPlayerEngine: ObservableObject {
     }
     
     public func stop() {
-        guard let player = mediaPlayer else { return }
-        libvlc_media_player_stop(player)
         self.state = .stopped
         self.currentTimeMs = 0
         self.position = 0.0
+        guard let player = mediaPlayer else { return }
+        vlcQueue.async { [weak self] in
+            libvlc_media_player_stop(player)
+            self?.cleanupMedia()
+        }
     }
     
     private func cleanupMedia() {
@@ -358,20 +374,24 @@ public class VLCPlayerEngine: ObservableObject {
     public func seek(toFraction fraction: Double) {
         guard let player = mediaPlayer else { return }
         let clamped = max(0.0, min(1.0, fraction))
-        libvlc_media_player_set_position(player, Float(clamped))
         self.position = clamped
         if durationMs > 0 {
             self.currentTimeMs = Int64(clamped * Double(durationMs))
+        }
+        vlcQueue.async {
+            libvlc_media_player_set_position(player, Float(clamped))
         }
     }
     
     public func seek(toMs ms: Int64) {
         guard let player = mediaPlayer else { return }
         let targetMs = max(0, ms)
-        libvlc_media_player_set_time(player, targetMs)
         self.currentTimeMs = targetMs
         if durationMs > 0 {
             self.position = Double(targetMs) / Double(durationMs)
+        }
+        vlcQueue.async {
+            libvlc_media_player_set_time(player, targetMs)
         }
     }
     
@@ -446,47 +466,56 @@ public class VLCPlayerEngine: ObservableObject {
     public func refreshTracks() {
         guard let player = mediaPlayer else { return }
         
-        // Refresh Audio Tracks
-        var audioList: [TrackItem] = []
-        let audioDesc = libvlc_audio_get_track_description(player)
-        var currentAudioDesc = audioDesc
-        while let desc = currentAudioDesc {
-            let id = desc.pointee.i_id
-            let nameStr: String
-            if let psz = desc.pointee.psz_name {
-                nameStr = String(cString: psz)
-            } else {
-                nameStr = "Track \(id)"
+        vlcQueue.async { [weak self] in
+            guard let self = self, let p = self.mediaPlayer else { return }
+            
+            // Refresh Audio Tracks
+            var audioList: [TrackItem] = []
+            let audioDesc = libvlc_audio_get_track_description(p)
+            var currentAudioDesc = audioDesc
+            while let desc = currentAudioDesc {
+                let id = desc.pointee.i_id
+                let nameStr: String
+                if let psz = desc.pointee.psz_name {
+                    nameStr = String(cString: psz)
+                } else {
+                    nameStr = "Track \(id)"
+                }
+                audioList.append(TrackItem(id: id, name: nameStr))
+                currentAudioDesc = desc.pointee.p_next
             }
-            audioList.append(TrackItem(id: id, name: nameStr))
-            currentAudioDesc = desc.pointee.p_next
-        }
-        if let audioDesc = audioDesc {
-            libvlc_track_description_list_release(audioDesc)
-        }
-        self.audioTracks = audioList
-        self.selectedAudioTrackId = libvlc_audio_get_track(player)
-        
-        // Refresh Subtitle (SPU) Tracks
-        var subList: [TrackItem] = []
-        let subDesc = libvlc_video_get_spu_description(player)
-        var currentSubDesc = subDesc
-        while let desc = currentSubDesc {
-            let id = desc.pointee.i_id
-            let nameStr: String
-            if let psz = desc.pointee.psz_name {
-                nameStr = String(cString: psz)
-            } else {
-                nameStr = id == -1 ? "Disable Subtitles" : "Subtitle \(id)"
+            if let audioDesc = audioDesc {
+                libvlc_track_description_list_release(audioDesc)
             }
-            subList.append(TrackItem(id: id, name: nameStr))
-            currentSubDesc = desc.pointee.p_next
+            let activeAudio = libvlc_audio_get_track(p)
+            
+            // Refresh Subtitle (SPU) Tracks
+            var subList: [TrackItem] = []
+            let subDesc = libvlc_video_get_spu_description(p)
+            var currentSubDesc = subDesc
+            while let desc = currentSubDesc {
+                let id = desc.pointee.i_id
+                let nameStr: String
+                if let psz = desc.pointee.psz_name {
+                    nameStr = String(cString: psz)
+                } else {
+                    nameStr = id == -1 ? "Disable Subtitles" : "Subtitle \(id)"
+                }
+                subList.append(TrackItem(id: id, name: nameStr))
+                currentSubDesc = desc.pointee.p_next
+            }
+            if let subDesc = subDesc {
+                libvlc_track_description_list_release(subDesc)
+            }
+            let activeSub = libvlc_video_get_spu(p)
+            
+            DispatchQueue.main.async {
+                self.audioTracks = audioList
+                self.selectedAudioTrackId = activeAudio
+                self.subtitleTracks = subList
+                self.selectedSubtitleTrackId = activeSub
+            }
         }
-        if let subDesc = subDesc {
-            libvlc_track_description_list_release(subDesc)
-        }
-        self.subtitleTracks = subList
-        self.selectedSubtitleTrackId = libvlc_video_get_spu(player)
     }
     
     public func setAudioTrack(id: Int32) {
@@ -625,7 +654,7 @@ public class VLCPlayerEngine: ObservableObject {
     
     private func startUpdateTimer() {
         stopUpdateTimer()
-        updateTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             self?.tick()
         }
     }
@@ -636,9 +665,30 @@ public class VLCPlayerEngine: ObservableObject {
     }
     
     private func tick() {
-        guard let player = mediaPlayer else { return }
+        guard !isTicking, let player = mediaPlayer else { return }
+        isTicking = true
         
-        let rawState = libvlc_media_player_get_state(player)
+        let seeking = isUserSeeking
+        
+        vlcQueue.async { [weak self] in
+            guard let self = self, let p = self.mediaPlayer else {
+                DispatchQueue.main.async { self?.isTicking = false }
+                return
+            }
+            
+            let rawState = libvlc_media_player_get_state(p)
+            let vouts = libvlc_media_player_has_vout(p)
+            let length = libvlc_media_player_get_length(p)
+            let current = seeking ? -1 : libvlc_media_player_get_time(p)
+            
+            DispatchQueue.main.async {
+                self.isTicking = false
+                self.applyTickUpdate(rawState: rawState, vouts: vouts, length: length, current: current)
+            }
+        }
+    }
+    
+    private func applyTickUpdate(rawState: libvlc_state_t, vouts: UInt32, length: Int64, current: Int64) {
         // LibVLC states: 0=NothingSpecial, 1=Opening, 2=Buffering, 3=Playing, 4=Paused, 5=Stopped, 6=Ended, 7=Error
         let newState: PlayerState
         switch rawState {
@@ -671,24 +721,19 @@ public class VLCPlayerEngine: ObservableObject {
             return
         }
         
-        let vouts = libvlc_media_player_has_vout(player)
         let isVideo = vouts > 0
         if self.hasVideo != isVideo {
             self.hasVideo = isVideo
         }
         
-        let length = libvlc_media_player_get_length(player)
         if length > 0 && self.durationMs != length {
             self.durationMs = length
         }
         
-        if !isUserSeeking {
-            let current = libvlc_media_player_get_time(player)
-            if current >= 0 {
-                self.currentTimeMs = current
-                if length > 0 {
-                    self.position = Double(current) / Double(length)
-                }
+        if !isUserSeeking && current >= 0 {
+            self.currentTimeMs = current
+            if length > 0 {
+                self.position = Double(current) / Double(length)
             }
             
             // Check A-B Loop boundaries

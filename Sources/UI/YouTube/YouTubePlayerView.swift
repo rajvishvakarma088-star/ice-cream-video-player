@@ -585,26 +585,33 @@ public struct YouTubePlayerView: View {
     // MARK: - Small Channels List Drawer View
     
     private var filteredChannels: [(index: Int, item: PlaylistItem)] {
-        let all: [(index: Int, item: PlaylistItem)] = playlist.items.enumerated().map { (index: $0.offset, item: $0.element) }
-        let filteredByGroup: [(index: Int, item: PlaylistItem)]
-        if let grp = selectedGroup, !grp.isEmpty {
-            filteredByGroup = all.filter { $0.item.group == grp }
-        } else {
-            filteredByGroup = all
-        }
-        
+        guard showChannelList else { return [] }
         let trimmed = channelSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            return Array(filteredByGroup.prefix(250))
-        } else {
-            let matched = filteredByGroup.filter { $0.item.title.localizedCaseInsensitiveContains(trimmed) }
-            return Array(matched.prefix(250))
+        var result: [(index: Int, item: PlaylistItem)] = []
+        result.reserveCapacity(200)
+        
+        let targetGroup = selectedGroup
+        let isSearching = !trimmed.isEmpty
+        
+        for (idx, item) in playlist.items.enumerated() {
+            if let grp = targetGroup, !grp.isEmpty {
+                if item.group != grp { continue }
+            }
+            if isSearching {
+                if !item.title.localizedCaseInsensitiveContains(trimmed) {
+                    continue
+                }
+            }
+            result.append((index: idx, item: item))
+            if result.count >= 200 {
+                break
+            }
         }
+        return result
     }
     
     private var availableGroups: [String] {
-        let groups = Set(playlist.items.compactMap { $0.group?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
-        return Array(groups).sorted()
+        return playlist.availableGroups
     }
     
     private var compactChannelListView: some View {
