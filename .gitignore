@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build artifacts & apps
+*.app
+*.dmg
+*.dSYM
+*.o
+*.swp
+
+# DerivedData
+DerivedData/
+.build/
+.swiftpm/
+
+# User artifacts
+test_audio.m4a

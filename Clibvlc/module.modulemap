@@ -1,0 +1,6 @@
+module Clibvlc [system] {
+    header "../include/vlc/vlc.h"
+    link "vlc"
+    link "vlccore"
+    export *
+}
